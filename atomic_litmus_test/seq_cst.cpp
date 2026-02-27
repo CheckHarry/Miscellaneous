@@ -5,7 +5,7 @@
 
 
 std::pair<int,int> test_relax() {
-    std::atomic<long long> x, y;
+    alignas(64) std::atomic<long long> x, y;
     x = 0;
     y = 0;
 
@@ -29,7 +29,7 @@ std::pair<int,int> test_relax() {
 }
 
 std::pair<int,int> test_acquire_release() {
-    std::atomic<long long> x, y;
+    alignas(64) std::atomic<long long> x, y;
     x = 0;
     y = 0;
 
@@ -53,7 +53,7 @@ std::pair<int,int> test_acquire_release() {
 }
 
 std::pair<int,int> test_seq_cst() {
-    std::atomic<long long> x, y;
+    alignas(64) std::atomic<long long> x, y;
     x = 0;
     y = 0;
 
@@ -76,9 +76,23 @@ std::pair<int,int> test_seq_cst() {
     return {xx,yy};
 }
 
-int main() {
+int main(int argc,char** argv) {
+    if (argc < 2) {
+        std::cout << "No order specify !\n";
+        return -1;
+    }
+
+    using func = std::pair<int,int> (*)(); 
+    std::string type = argv[1];
+    func func_ptr;
+    if (type == "seq_cst") {
+        func_ptr = &test_seq_cst;
+    } else if (type == "relaxed") {
+        func_ptr = &test_relax;
+    }
+
     while (true) {
-        auto [x,y] = test_seq_cst();
+        auto [x,y] = func_ptr();
         //std::cout << x << " " << y << '\n';
         if (x == 0 && y == 0) {
             std::cout << "CATCH!\n";
