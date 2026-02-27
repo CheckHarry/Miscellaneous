@@ -5,11 +5,8 @@
 #include <vector>
 
 
-
-
-
 long long test_relaxed() {
-    std::atomic<long long> x;
+    std::atomic<long long> x{};
     long long b = 21;
     
     std::atomic<bool> start{false};
@@ -32,13 +29,41 @@ long long test_relaxed() {
     return res;
 }
 
+
+long long test_seq_cst() {
+    std::atomic<long long> x{};
+    long long b = 21;
+    
+    std::atomic<bool> start{false};
+    int res = -1;
+    auto th1 = std::thread([&](){
+        while (!start.load(std::memory_order_seq_cst));
+        b = 169;
+        x.store(1,std::memory_order_seq_cst);
+    });
+    auto th2 = std::thread([&](){
+        while (!start.load(std::memory_order_seq_cst));
+        
+        while (!x.load(std::memory_order_seq_cst));
+        res = b;
+    });
+
+    start.store(true, std::memory_order_seq_cst);
+    th1.join();
+    th2.join();
+    return res;
+}
+
+
 int main() {
     
+    test_relaxed();
+    /*
     while (true) {
         if (test_relaxed() != 169) {
             std::cout << "CATCH!\n";
             break;
         }
-    }
+    }*/
         
 }
