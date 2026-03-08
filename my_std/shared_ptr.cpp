@@ -28,6 +28,10 @@ class my_shared_ptr
         return *this;
     }
 
+    operator bool() {
+        return static_cast<bool>(raw_ptr);
+    };
+
     T* operator->() {
         return raw_ptr;
     };
