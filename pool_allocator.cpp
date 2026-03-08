@@ -6,26 +6,15 @@
 #include <cassert>
 #include <vector>
 #include <set>
-
+#include <atomic>
 
 using namespace std;
-
-
-void* extract_ptr(__uint128_t t) {
-    __uint128_t a = 1;
-    a = (a << 65);
-    return (void*)(t & (a - 1));
-}
-
-__uint128_t pack_ptr(uint64_t tag,void *ptr) {
-    return (__uint128_t(tag) << 64) | __uint128_t(ptr);
-}
 
 
 class PoolAllocator
 {
     public:
-    explicit PoolAllocator(size_t obj_size, size_t total_size) : obj_size_(max(obj_size, sizeof(Node))), total_size_(total_size) , mem_(new char[obj_size_ * total_size_]) {
+    explicit PoolAllocator(size_t obj_size, size_t total_size) : obj_size_(max(obj_size, sizeof(void*))), total_size_(total_size) , mem_(new char[obj_size_ * total_size_]) {
         construct_free_list();
     }
 
@@ -33,14 +22,14 @@ class PoolAllocator
         for (size_t i = 0;i < total_size_;i ++) {
             Node *new_node = reinterpret_cast<Node*>(&mem_[i * obj_size_]);
             new_node->next = free_list;  
-            free_list = pack_ptr(0,new_node);
+            free_list = new_node;
         }
     };
 
     void* alloc() {
-        if (extract_ptr(free_list)) {
-            void* to_return = extract_ptr(free_list);
-            free_list = static_cast<Node*>(extract_ptr(free_list))->next;
+        if (free_list) {
+            void* to_return = free_list;
+            free_list = free_list->next;
             return to_return;
         }
         return nullptr;
@@ -49,23 +38,21 @@ class PoolAllocator
     void dealloc(void *ptr) {
         Node *return_to_list = reinterpret_cast<Node*>(ptr);
         return_to_list->next = free_list;
-        free_list = pack_ptr(0, return_to_list);
+        free_list = return_to_list;
     }
 
 
     private:
     struct Node {
-        __uint128_t next;
+        Node* next;
     };
-
-    using lock_free_list_ptr_type = std::atomic<__uint128_t>;
-    //static_assert(lock_free_list_ptr_type{}.is_lock_free());
 
     size_t obj_size_;
     size_t total_size_;
     std::unique_ptr<char[]> mem_;
-    __uint128_t free_list{};
+    Node* free_list = nullptr;
 };
+
 
 
 
@@ -201,15 +188,7 @@ void test_interleaved_alloc_dealloc() {
 }
 
 
-void test_pack_and_extract_ptr() {
-    std::cout << "[PASS] test_pack_and_extract_ptr\n";
-    int a = 5;
-    assert(extract_ptr(pack_ptr(0, &a)) == &a);
-}
-
-
 int main() {
-    test_pack_and_extract_ptr();
     test_basic_alloc();
     test_exhaust_pool();
     test_all_pointers_unique();
