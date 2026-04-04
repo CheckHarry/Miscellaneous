@@ -29,12 +29,13 @@
     }
 
 #define debug(msg)                              \
-    {                                           \
+    do {                                           \
         std::cerr << "[" << __LINE__ << "]"     \
                   << " : " << msg << std::endl; \
-    }
+    } while (0)
 
 namespace MyFtp {
+
 
 struct FileDesc {
     static constexpr std::uint64_t namesize = 256;
@@ -192,6 +193,12 @@ private:
 
 // parsing incoming tcp stream into command
 
+enum class ParseResult {
+    Continue,
+    WaitData, // wait more data
+    Fatal // something wrong on client , close their connections
+};
+
 class CommandParser {
 public:
     CommandParser(CircularBuffer& cb) : cbuf{cb} {}
@@ -201,10 +208,10 @@ public:
         filename_size = 0;
     }
 
-    bool handle_init() {
-        std::byte buf[4096];
-        if (cbuf.must_read(buf, sizeof(CommandEnum)) != 0) return false;
-        auto cmdenum = *reinterpret_cast<CommandEnum*>(&buf);
+    ParseResult handle_init() {
+        std::byte buf[sizeof(CommandEnum)];
+        if (cbuf.must_read(buf, sizeof(CommandEnum)) != 0) return ParseResult::WaitData;
+        auto cmdenum = std::bit_cast<CommandEnum>(buf);
         switch (cmdenum) {
             case CommandEnum::list:
                 cmdeq.push_back(std::make_unique<ListCommand>());
@@ -214,30 +221,31 @@ public:
                 state = State::ParseDownloadFileNameSize;
                 break;
             default:
-                error("invalid command");
+                return ParseResult::Fatal;
         }
-        return true;
+        return ParseResult::Continue;
     }
 
-    bool handle_parse_download_file_name_size() {
-        std::byte buf[4096];
-        if (cbuf.must_read(buf, sizeof(std::uint8_t)) != 0) return false;
-        filename_size = *reinterpret_cast<std::uint8_t*>(&buf) + 1;
-        debug((int)filename_size) state = State::ParseDownloadFileName;
-        return true;
+    ParseResult handle_parse_download_file_name_size() {
+        std::byte buf[sizeof(std::uint8_t)];
+        if (cbuf.must_read(buf, sizeof(std::uint8_t)) != 0) return ParseResult::WaitData;
+        filename_size = std::bit_cast<std::uint8_t>(buf);
+        debug((int)filename_size); 
+        state = State::ParseDownloadFileName;
+        return ParseResult::Continue;
     }
 
-    bool handle_parse_download_file_name() {
+    ParseResult handle_parse_download_file_name() {
         std::byte buf[4096]{};
-        if (cbuf.must_read(buf, filename_size) != 0) return false;
-        std::string filename(reinterpret_cast<char*>(&buf), filename_size);
-        debug(filename);
+        if (cbuf.must_read(buf, filename_size) != 0) return ParseResult::WaitData;
+        buf[filename_size] = std::byte{0};
+        std::string filename(reinterpret_cast<const char*>(&buf));
         cmdeq.push_back(std::make_unique<DownloadCommand>(filename));
         reset();
-        return true;
+        return ParseResult::Continue;
     }
 
-    bool exhaust_one() {
+    ParseResult exhaust_one() {
         switch (state) {
             case State::Init:
                 return handle_init();
@@ -249,8 +257,20 @@ public:
         error("invalid state");
     }
 
-    void exhasut() {
-        while (exhaust_one()) {
+    // return false if we found anything bad and need dc
+    bool exhaust() { 
+        auto res = exhaust_one();
+        while (true) {
+            switch (res)
+            {
+                case ParseResult::Continue:
+                    break;
+                case ParseResult::WaitData:
+                    return true;
+                case ParseResult::Fatal:
+                    return false;
+            }
+            res = exhaust_one();
         }
     }
 
@@ -274,23 +294,30 @@ private:
         ParseDownloadFileName
     };
 
-    State state;
+    State state = State::Init;
     std::uint8_t filename_size = 0;  // only meaning ful when state = ParseDownloadFileName;
 };
 
 class TcpMsgParser {
 public:
-    void exahust() {
-        parser.exhasut();
+    bool exhaust() {
+        return parser.exhaust();
     }
 
-    void receive(const std::byte* buf, size_t len) {
-        exahust();
-        assert(cbuf.push(buf, len) == len);
+    bool receive(const std::byte* buf, size_t len) { 
+        if (!exhaust()) return false;
+        size_t l = cbuf.push(buf, len);
+        while (l < len) {
+            if (!exhaust()) return false;  // command size is less then 4096
+            buf += l;
+            len -= l;
+            l = cbuf.push(buf, len);
+        }
+        return true;
     }
 
     std::unique_ptr<Command> pop() {
-        exahust();
+        exhaust();
         return parser.pop();
     }
 
@@ -316,6 +343,7 @@ struct Context {
         ListRes res;
 
         for (const auto& entry : fs::directory_iterator(".")) {
+            if (!entry.is_regular_file()) continue;
             auto desc = FileDesc{entry.file_size()};
             auto ss = entry.path().filename().string();
             desc.filename_length = ss.size();
@@ -330,10 +358,20 @@ struct Context {
         namespace fs = std::filesystem;
 
         DownloadRes res;
+        auto base = fs::canonical(".");
+        auto target = fs::weakly_canonical(fs::path(cmd.filename));
+        // Verify target starts with base
+        auto [rootEnd, _] = std::mismatch(base.begin(), base.end(), target.begin());
+        if (rootEnd != base.end()) {
+            debug("Path traversal attempt blocked");
+            return serialize_to(DownloadRes{});
+        }
+
         std::ifstream file(cmd.filename, std::ios::binary | std::ios::ate);
         debug(cmd.filename);
         if (!file.is_open()) {
-            debug("Cannot open file") return serialize_to(res);
+            debug("Cannot open file");
+            return serialize_to(res);
         }
 
         std::streamsize fileSize = file.tellg();
@@ -360,21 +398,21 @@ struct Context {
         return {};
     }
 
-    void receive(const std::byte* buf, size_t n) {
-        msg_parser.receive(buf, n);
+    bool receive(const std::byte* buf, size_t n) {
+        return msg_parser.receive(buf, n);
     }
 
-    void handle_one(auto&& func) {  // writer func
+    bool handle_one(auto&& func) {  // writer func
         while (auto d = msg_parser.pop()) {
             auto msg = handle_one_command(d.get());
-            func(msg.data(), msg.size());
+            if (!func(msg.data(), msg.size())) return false;
         }
+        return true;
     }
 
 private:
     TcpMsgParser msg_parser;
     sockaddr_in socketaddr;
-    std::deque<Command> commands;
 };
 
 class TcpServer {
@@ -478,13 +516,14 @@ public:
     }
 
     void cleanup_connection_fd(int fd) {
+        debug("cleanup connection fd");
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
         close(fd);
         fd_to_address.erase(fd);
     }
 
     void handle_connection(epoll_event event) {
-        std::byte buffer[30000];
+        std::byte buffer[4096];
         ssize_t valread = ::read(event.data.fd, buffer, sizeof(buffer) - 1);
         if (valread <= 0) {
             if (valread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -495,9 +534,15 @@ public:
         }
 
         Context& context = fd_to_address.at(event.data.fd);
-        context.receive(buffer, valread);
-        context.handle_one(
-            [this, &event](const std::byte* buf, size_t n) { write_all(event.data.fd, buf, n); });
+        if (!context.receive(buffer, valread)) {
+            cleanup_connection_fd(event.data.fd);
+            return;
+        }
+        if (!context.handle_one([this, &event](const std::byte* buf, size_t n) {
+                return write_all(event.data.fd, buf, n);
+            })) {
+            cleanup_connection_fd(event.data.fd);
+        }
     }
 
 private:
@@ -509,7 +554,6 @@ private:
                 if (errno == EINTR) {
                     continue;
                 }
-                cleanup_connection_fd(fd);
                 return false;
             }
             total_written += written;
