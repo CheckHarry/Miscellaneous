@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #define error(msg)                                                                \
@@ -29,13 +30,12 @@
     }
 
 #define debug(msg)                              \
-    do {                                           \
+    do {                                        \
         std::cerr << "[" << __LINE__ << "]"     \
                   << " : " << msg << std::endl; \
     } while (0)
 
 namespace MyFtp {
-
 
 struct FileDesc {
     static constexpr std::uint64_t namesize = 256;
@@ -101,57 +101,16 @@ struct DownloadRes {
     }
 };
 
-struct __attribute__((packed)) FileDescHeader {
-    static constexpr std::uint64_t namesize = 256;
-    std::uint64_t size;
-    std::uint8_t filename_length;
-};
-
-struct __attribute__((packed)) ListResHeader {
-    std::uint16_t dir_size;
-};
-
 enum class CommandEnum : uint8_t { list = 1, download = 2 };
 
-// B stand for binary protocol , we rely on this class to parse data from tcp
-struct __attribute__((packed)) CommandBaseB {
-    CommandEnum command_enum;
-};
-
-struct __attribute__((packed)) DownloadCommandB {
-    CommandBaseB commandbase;
-    std::uint8_t filename_size = 0;
-};
-
-#define DEFINE_VIRTUAL_GETTER(name) \
-    virtual name* get##name() {     \
-        return nullptr;             \
-    }
-struct ListCommand;
-struct DownloadCommand;
-
-struct Command {
-public:
-    virtual ~Command() = default;
-    // virtual DownloadCommand* getDownloadCommand() {return nullptr;}
-    DEFINE_VIRTUAL_GETTER(DownloadCommand)
-    DEFINE_VIRTUAL_GETTER(ListCommand)
-private:
-};
-
-struct DownloadCommand : public Command {
+struct DownloadCommand {
     DownloadCommand(std::string f) : filename(f) {}
     std::string filename;
-    DownloadCommand* getDownloadCommand() override {
-        return this;
-    }
 };
 
-struct ListCommand : public Command {
-    ListCommand* getListCommand() override {
-        return this;
-    }
-};
+struct ListCommand {};
+
+using Command = std::variant<DownloadCommand, ListCommand>;
 
 class CircularBuffer {
 public:
@@ -195,14 +154,12 @@ private:
 
 enum class ParseResult {
     Continue,
-    WaitData, // wait more data
-    Fatal // something wrong on client , close their connections
+    WaitData,  // wait more data
+    Fatal      // something wrong on client , close their connections
 };
 
 class CommandParser {
 public:
-    CommandParser(CircularBuffer& cb) : cbuf{cb} {}
-
     void reset() {
         state = State::Init;
         filename_size = 0;
@@ -214,7 +171,7 @@ public:
         auto cmdenum = std::bit_cast<CommandEnum>(buf);
         switch (cmdenum) {
             case CommandEnum::list:
-                cmdeq.push_back(std::make_unique<ListCommand>());
+                cmdeq.push_back(std::make_unique<Command>(ListCommand{}));
                 reset();
                 break;
             case CommandEnum::download:
@@ -230,7 +187,7 @@ public:
         std::byte buf[sizeof(std::uint8_t)];
         if (cbuf.must_read(buf, sizeof(std::uint8_t)) != 0) return ParseResult::WaitData;
         filename_size = std::bit_cast<std::uint8_t>(buf);
-        debug((int)filename_size); 
+        debug((int)filename_size);
         state = State::ParseDownloadFileName;
         return ParseResult::Continue;
     }
@@ -240,7 +197,7 @@ public:
         if (cbuf.must_read(buf, filename_size) != 0) return ParseResult::WaitData;
         buf[filename_size] = std::byte{0};
         std::string filename(reinterpret_cast<const char*>(&buf));
-        cmdeq.push_back(std::make_unique<DownloadCommand>(filename));
+        cmdeq.push_back(std::make_unique<Command>(DownloadCommand{std::move(filename)}));
         reset();
         return ParseResult::Continue;
     }
@@ -258,11 +215,10 @@ public:
     }
 
     // return false if we found anything bad and need dc
-    bool exhaust() { 
+    bool exhaust() {
         auto res = exhaust_one();
         while (true) {
-            switch (res)
-            {
+            switch (res) {
                 case ParseResult::Continue:
                     break;
                 case ParseResult::WaitData:
@@ -283,9 +239,21 @@ public:
         return nullptr;
     }
 
+    bool receive(const std::byte* buf, size_t len) {
+        if (!exhaust()) return false;
+        size_t l = cbuf.push(buf, len);
+        while (l < len) {
+            if (!exhaust()) return false;  // command size is less then 4096
+            buf += l;
+            len -= l;
+            l = cbuf.push(buf, len);
+        }
+        return true;
+    }
+
 private:
     std::deque<std::unique_ptr<Command>> cmdeq;
-    CircularBuffer& cbuf;
+    CircularBuffer cbuf;
     // if commandEnum == List , not need to parse further
     // if commandEnum == Download , parse
     enum class State {
@@ -298,34 +266,6 @@ private:
     std::uint8_t filename_size = 0;  // only meaning ful when state = ParseDownloadFileName;
 };
 
-class TcpMsgParser {
-public:
-    bool exhaust() {
-        return parser.exhaust();
-    }
-
-    bool receive(const std::byte* buf, size_t len) { 
-        if (!exhaust()) return false;
-        size_t l = cbuf.push(buf, len);
-        while (l < len) {
-            if (!exhaust()) return false;  // command size is less then 4096
-            buf += l;
-            len -= l;
-            l = cbuf.push(buf, len);
-        }
-        return true;
-    }
-
-    std::unique_ptr<Command> pop() {
-        exhaust();
-        return parser.pop();
-    }
-
-private:
-    CircularBuffer cbuf;
-    CommandParser parser{cbuf};
-};
-
 template <typename T>
 std::vector<std::byte> serialize_to(const T& cmd) {
     std::vector<std::byte> to_return;
@@ -336,7 +276,48 @@ std::vector<std::byte> serialize_to(const T& cmd) {
 }
 
 struct Connection {
-    Connection(sockaddr_in sockaddr) : socketaddr{sockaddr} {}
+    Connection(sockaddr_in sockaddr, int fd_) : closed{false}, fd{fd_}, socketaddr{sockaddr} {}
+
+    void receive_data_from_fd() {
+        std::byte buffer[4096];
+        ssize_t valread = ::read(fd, buffer, sizeof(buffer) - 1);
+        if (valread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        if (valread <= 0) {
+            close();
+            return;
+        }
+        receive(buffer, valread);
+    }
+
+    // writer func , need further refactor for nonblocking fd
+    void handle_one(auto&& func) {
+        if (is_closed()) return;
+        while (auto d = cmd_parser.pop()) {
+            auto msg = handle_one_command(d.get());
+            if (!func(msg.data(), msg.size())) {
+                close();
+                return;
+            }
+        }
+    }
+
+    bool is_closed() const {
+        return closed;
+    }
+
+private:
+    void receive(const std::byte* buf, size_t n) {
+        if (is_closed()) return;
+        if (!cmd_parser.receive(buf, n)) {
+            close();
+        }
+    }
+
+    void close() {
+        closed = true;
+    }
 
     std::vector<std::byte> handle_list() {
         namespace fs = std::filesystem;
@@ -386,33 +367,21 @@ struct Connection {
         return serialize_to(res);
     }
 
+    template <class... Ts>
+    struct overloads : Ts... {
+        using Ts::operator()...;
+    };
+
     std::vector<std::byte> handle_one_command(Command* cmd) {
-        if (cmd->getListCommand()) {
-            return handle_list();
-        }
-
-        if (cmd->getDownloadCommand()) {
-            return handle_download(*cmd->getDownloadCommand());
-        }
-        std::cout << "Not recognize command !\n";
-        return {};
+        return std::visit(
+            overloads{[this](const ListCommand& cmd) { return handle_list(); },
+                      [this](const DownloadCommand& cmd) { return handle_download(cmd); }},
+            *cmd);
     }
 
-    bool receive(const std::byte* buf, size_t n) {
-        return msg_parser.receive(buf, n);
-    }
-
-    bool handle_one(auto&& func) {  // writer func
-        while (auto d = msg_parser.pop()) {
-            auto msg = handle_one_command(d.get());
-            if (!func(msg.data(), msg.size())) return false;
-        }
-        return true;
-    }
-
-private:
     bool closed = false;
-    TcpMsgParser msg_parser;
+    int fd;
+    CommandParser cmd_parser;
     sockaddr_in socketaddr;
 };
 
@@ -503,7 +472,7 @@ public:
             error("accept");
         }
 
-        fd_to_connection.emplace(socket, addr);
+        fd_to_connection.emplace(socket, Connection{addr, socket});
 
         epoll_event ev;
         ev.events = EPOLLIN;
@@ -524,24 +493,12 @@ public:
     }
 
     void handle_connection(epoll_event event) {
-        std::byte buffer[4096];
-        ssize_t valread = ::read(event.data.fd, buffer, sizeof(buffer) - 1);
-        if (valread <= 0) {
-            if (valread < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                return;
-            }
-            cleanup_connection_fd(event.data.fd);
-            return;
-        }
-
-        Connection& context = fd_to_connection.at(event.data.fd);
-        if (!context.receive(buffer, valread)) {
-            cleanup_connection_fd(event.data.fd);
-            return;
-        }
-        if (!context.handle_one([this, &event](const std::byte* buf, size_t n) {
-                return write_all(event.data.fd, buf, n);
-            })) {
+        Connection& conn = fd_to_connection.at(event.data.fd);
+        conn.receive_data_from_fd();
+        conn.handle_one([this, &event](const std::byte* buf, size_t n) {
+            return write_all(event.data.fd, buf, n);
+        });
+        if (conn.is_closed()) {
             cleanup_connection_fd(event.data.fd);
         }
     }
