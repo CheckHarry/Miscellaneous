@@ -111,7 +111,7 @@ struct DownloadRes {
     }
 };
 
-enum class CommandEnum : uint8_t { list = 1, download = 2 };
+enum class CommandEnum : uint8_t { unknown = 0, list = 1, download = 2 };
 
 struct DownloadCommand {
     DownloadCommand(std::string f) : filename(f) {}
@@ -176,9 +176,9 @@ public:
     }
 
     ParseResult handle_init() {
-        std::byte buf[sizeof(CommandEnum)];
-        if (cbuf.must_read(buf, sizeof(CommandEnum)) != 0) return ParseResult::WaitData;
-        auto cmdenum = std::bit_cast<CommandEnum>(buf);
+        CommandEnum cmdenum{};
+        if (cbuf.must_read(reinterpret_cast<std::byte*>(&cmdenum), sizeof(CommandEnum)) != 0) return ParseResult::WaitData;
+        
         switch (cmdenum) {
             case CommandEnum::list:
                 cmdeq.push_back(std::make_unique<Command>(ListCommand{}));
@@ -249,21 +249,20 @@ public:
     }
 
     bool receive(const std::byte* buf, size_t len) {
-        size_t l;
+        size_t total{};
         do {
-            l = cbuf.push(buf, len);
+            size_t l = cbuf.push(buf, len);
             if (!exhaust()) return false;  // command size is less then 4096
             buf += l;
-            len -= l;
-        } while (l < len);
+            total += l;
+        } while (total < len);
         return true;
     }
 
 private:
     std::deque<std::unique_ptr<Command>> cmdeq;
     CircularBuffer cbuf;
-    // if commandEnum == List , not need to parse further
-    // if commandEnum == Download , parse
+
     enum class State {
         Init,  // no
         ParseDownloadFileNameSize,
@@ -300,7 +299,7 @@ struct Connection {
     }
 
     // writer func , need further refactor for nonblocking fd
-    void handle_one(auto&& func) {
+    void handle(auto&& func) {
         if (is_closed()) return;
         while (auto d = cmd_parser.pop()) {
             auto msg = handle_one_command(d.get());
@@ -475,7 +474,8 @@ public:
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 return;
             }
-            error("accept");
+            debug("error accepting");
+            return;
         }
 
         fd_to_connection.emplace(socket, Connection{addr, socket});
@@ -501,7 +501,7 @@ public:
     void handle_connection(epoll_event event) {
         Connection& conn = fd_to_connection.at(event.data.fd);
         conn.receive_data_from_fd();
-        conn.handle_one([this, &event](const std::byte* buf, size_t n) {
+        conn.handle([this, &event](const std::byte* buf, size_t n) {
             return write_all(event.data.fd, buf, n);
         });
         if (conn.is_closed()) {
