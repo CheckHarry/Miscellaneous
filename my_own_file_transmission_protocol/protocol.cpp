@@ -29,13 +29,12 @@
     }
 
 #define debug(msg)                              \
-    do {                                           \
+    do {                                        \
         std::cerr << "[" << __LINE__ << "]"     \
                   << " : " << msg << std::endl; \
     } while (0)
 
 namespace MyFtp {
-
 
 struct FileDesc {
     static constexpr std::uint64_t namesize = 256;
@@ -195,8 +194,8 @@ private:
 
 enum class ParseResult {
     Continue,
-    WaitData, // wait more data
-    Fatal // something wrong on client , close their connections
+    WaitData,  // wait more data
+    Fatal      // something wrong on client , close their connections
 };
 
 class CommandParser {
@@ -230,7 +229,7 @@ public:
         std::byte buf[sizeof(std::uint8_t)];
         if (cbuf.must_read(buf, sizeof(std::uint8_t)) != 0) return ParseResult::WaitData;
         filename_size = std::bit_cast<std::uint8_t>(buf);
-        debug((int)filename_size); 
+        debug((int)filename_size);
         state = State::ParseDownloadFileName;
         return ParseResult::Continue;
     }
@@ -258,11 +257,10 @@ public:
     }
 
     // return false if we found anything bad and need dc
-    bool exhaust() { 
+    bool exhaust() {
         auto res = exhaust_one();
         while (true) {
-            switch (res)
-            {
+            switch (res) {
                 case ParseResult::Continue:
                     break;
                 case ParseResult::WaitData:
@@ -304,7 +302,7 @@ public:
         return parser.exhaust();
     }
 
-    bool receive(const std::byte* buf, size_t len) { 
+    bool receive(const std::byte* buf, size_t len) {
         if (!exhaust()) return false;
         size_t l = cbuf.push(buf, len);
         while (l < len) {

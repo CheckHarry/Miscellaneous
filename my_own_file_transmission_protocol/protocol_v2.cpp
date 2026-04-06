@@ -29,10 +29,17 @@
         std::exit(-1);                                                            \
     }
 
-#define debug(msg)                              \
-    do {                                        \
-        std::cerr << "[" << __LINE__ << "]"     \
-                  << " : " << msg << std::endl; \
+template <typename... Args>
+void log(auto& ss, Args&&... args) {
+    (ss << ... << args);
+}
+
+#define debug(...)                          \
+    do {                                    \
+        std::cerr << "[" << __LINE__ << "]" \
+                  << " : ";                 \
+        log(std::cerr, __VA_ARGS__);        \
+        std::cerr << std::endl;             \
     } while (0)
 
 namespace MyFtp {
@@ -85,8 +92,11 @@ struct DownloadRes {
         if (!success) {
             if (ptr) {
                 memset(ptr, 0, 1);
+                ptr += 1;
+                size_t ss = 0;
+                memcpy(ptr, &ss, sizeof(ss));
             }
-            return sizeof(bool);
+            return sizeof(bool) + sizeof(size_t);
         } else {
             if (ptr) {
                 memset(ptr, 1, 1);
@@ -187,7 +197,6 @@ public:
         std::byte buf[sizeof(std::uint8_t)];
         if (cbuf.must_read(buf, sizeof(std::uint8_t)) != 0) return ParseResult::WaitData;
         filename_size = std::bit_cast<std::uint8_t>(buf);
-        debug((int)filename_size);
         state = State::ParseDownloadFileName;
         return ParseResult::Continue;
     }
@@ -240,14 +249,13 @@ public:
     }
 
     bool receive(const std::byte* buf, size_t len) {
-        if (!exhaust()) return false;
-        size_t l = cbuf.push(buf, len);
-        while (l < len) {
+        size_t l;
+        do {
+            l = cbuf.push(buf, len);
             if (!exhaust()) return false;  // command size is less then 4096
             buf += l;
             len -= l;
-            l = cbuf.push(buf, len);
-        }
+        } while (l < len);
         return true;
     }
 
@@ -316,6 +324,7 @@ private:
     }
 
     void close() {
+        debug("fd ", fd, " closed");
         closed = true;
     }
 
@@ -337,7 +346,6 @@ private:
 
     std::vector<std::byte> handle_download(DownloadCommand cmd) {
         namespace fs = std::filesystem;
-
         DownloadRes res;
         auto base = fs::canonical(".");
         auto target = fs::weakly_canonical(fs::path(cmd.filename));
@@ -349,14 +357,12 @@ private:
         }
 
         std::ifstream file(cmd.filename, std::ios::binary | std::ios::ate);
-        debug(cmd.filename);
         if (!file.is_open()) {
             debug("Cannot open file");
             return serialize_to(res);
         }
 
         std::streamsize fileSize = file.tellg();
-        debug(fileSize);
         file.seekg(0, std::ios::beg);
         res.filedata.resize(fileSize);
         if (file.read(reinterpret_cast<char*>(res.filedata.data()), fileSize)) {
