@@ -464,6 +464,13 @@ public:
         std::cout << "finished" << std::endl;
     }
 
+    void set_nonblocking(int fd) {
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            error("fcntl nonblock");
+        }
+    }
+
     void handle_accept() {
         sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
@@ -477,6 +484,8 @@ public:
             debug("error accepting");
             return;
         }
+
+        set_nonblocking(socket);
 
         fd_to_connection.emplace(socket, Connection{addr, socket});
 
