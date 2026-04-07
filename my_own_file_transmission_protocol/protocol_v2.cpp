@@ -485,7 +485,7 @@ public:
             return;
         }
 
-        set_nonblocking(socket);
+        //set_nonblocking(socket);
 
         fd_to_connection.emplace(socket, Connection{addr, socket});
 
